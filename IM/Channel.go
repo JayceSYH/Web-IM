@@ -3,8 +3,8 @@ package IM
 import (
 	"sync/atomic"
 	"time"
-	"fmt"
 	"errors"
+	"log"
 )
 
 const (
@@ -149,7 +149,7 @@ func (c *BaseChannel) Stop() { atomic.StoreUint32(&c.stateFlag, 0) }
 func (c *BaseChannel) HandleMessage(Message) {}
 func (c *BaseChannel) StartChannelLoop(g *ChannelGroup)  {
 	if atomic.LoadUint32(&c.stateFlag) == 1 {
-		fmt.Println("Channel Already Started")
+		log.Print("Channel Already Started")
 		return
 	}
 
@@ -160,8 +160,8 @@ func (c *BaseChannel) StartChannelLoop(g *ChannelGroup)  {
 		defer func() {
 			if err := recover(); err != nil {
 				atomic.StoreUint32(&c.stateFlag, 0)
-				fmt.Println(err)
-				fmt.Println("Channel Restart Automatically...")
+				log.Print(err)
+				log.Print("Channel Restart Automatically...")
 				c.StartChannelLoop(g)
 			}
 		}()

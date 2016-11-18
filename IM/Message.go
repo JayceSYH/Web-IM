@@ -3,7 +3,7 @@ package IM
 import (
 	"time"
 	"errors"
-	"fmt"
+	"log"
 )
 
 
@@ -36,6 +36,10 @@ type Message interface {
 	SenderId() string			//Get Message sender id
 	SetTargetId(string)			//Set Message Type id
 	SetSenderId(string)			//Set Sender
+
+	IsGroupMessage() bool			//If This Message Is Group Message
+	GroupName() string			//Group Name
+	SetGroup(string)			//Set Group
 }
 
 
@@ -48,6 +52,9 @@ type DefaultMessage struct {
 	messageType string
 	target string
 	sender string
+
+	isGroup bool
+	groupName string
 
 	errorChan chan error
 
@@ -76,6 +83,16 @@ func (t *DefaultMessage) Wait(d time.Duration) error {
 	}
 }
 func (t *DefaultMessage) Finish(e error) { t.errorChan <- e }
+func (t *DefaultMessage) SetGroup(g string) {
+	t.isGroup = true
+	t.groupName = g
+}
+func (t *DefaultMessage) IsGroupMessage() bool {
+	return t.isGroup
+}
+func (t *DefaultMessage) GroupName() string {
+	return t.groupName
+}
 
 
 /*
@@ -97,7 +114,7 @@ func NewTextMessage(content string) Message {
 	}
 }
 
-func (t *TextMessage) OnReceived() { fmt.Printf("Message received(%d), target: %v\n", t.Id(), t.TargetId()) }
+func (t *TextMessage) OnReceived() { log.Printf("Message received(%d), target: %v\n", t.Id(), t.TargetId()) }
 func (t *TextMessage) OnBinary() ([]byte, error) {
 	if s, ok := t.Content().(string); ok {
 		return []byte(s), nil
@@ -125,7 +142,7 @@ func NewPictureMessage(content []byte, suffix string) *PictureMessage {
 		suffix		: suffix,
 	}
 }
-func (m *PictureMessage) OnReceived() { fmt.Println("Picture message received") }
+func (m *PictureMessage) OnReceived() { log.Print("Picture message received") }
 func (m *PictureMessage) OnBinary() ([]byte, error) {
 	if bs, ok := m.content.([]byte); ok {
 		return bs, nil
@@ -153,7 +170,7 @@ func NewFileMessage(content []byte, filename string) *FileMessage {
 		filename		: filename,
 	}
 }
-func (m *FileMessage) OnReceived() { fmt.Println("Picture message received") }
+func (m *FileMessage) OnReceived() { log.Print("Picture message received") }
 func (m *FileMessage) OnBinary() ([]byte, error) {
 	if bs, ok := m.content.([]byte); ok {
 		return bs, nil

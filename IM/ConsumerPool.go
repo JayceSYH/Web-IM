@@ -1,50 +1,92 @@
 package IM
 
 import (
-	"time"
-	"fmt"
 	"sync"
 	"sync/atomic"
-	"errors"
 	"runtime"
+	"strings"
+	"container/list"
+	"errors"
+	"github.com/labstack/gommon/log"
 )
 
 const (
-	defaultBuffSize = 20
-	defaultTimeout = time.Second * 3
+	DefaultReceiverBufferSize = 20
 )
 
 /*
 * A consumer pool receive message from only one message group
-* and then cache or persistent the message for a target user
+* and then dispatch these messages through consumers which runs in
+* its own goroutine
 */
 type ConsumerPool interface {
-	OnConsumerExpired(*Consumer) error				//If message is handled, return nil, else return some error to notify sender
-	OnRequestedConsumerMiss(id string) (*Consumer, error) 	//If message is handled, set err to nil, else return some error to notify sender
-	OnMessageTargetMiss(Message) error 				//If message is handled, return nil, else return some error to notify sender
+	OnNewReceiver(id string) 					//If message is handled, set err to nil, else return some error to notify sender
+	OnMessageTargetMiss(Message, string) error 			//If message is handled, return nil, else return some error to notify sender
 	Consume(Message)						//Consume message
 	Start(chan Message)						//Start consumer pool
 	Stop()								//Stop consumer pool
-	ReceiveMessages(string, bool) (*MessageReceiver, error)	//Get a receiver which is a broker between consumer and user
-	StopReceiveMessages(string) error				//unregister a message consumer
+	Get() *Consumer							//Get a consumer
+	Recycle(c *Consumer)						//Recycle consumer
+	ReceiveMessages(string, bool) (*MessageReceiver, error)		//Get a receiver which is a broker between consumer and user
+	CloseReceiver(*MessageReceiver)
+	Receivers(id string) (*ReceiverList, bool)
 }
 
 /*
 * Default consumer pool creator
 */
-func NewConsumerPool(onConsumerExpired func(*Consumer) error,
-	onRequestedConsumerMiss func(string)(*Consumer, error),
-	onMessageTargetMiss func(Message, ConsumerPool) error) ConsumerPool {
+func NewConsumerPool(onNewReceiver func(string),
+	onMessageTargetMiss func(Message, string) error) ConsumerPool {
 
-	return &DefaultConsumerPool{
+	pool := &DefaultConsumerPool{
 		stopFlag			: 0,
-		consumers			: make(map[string]*Consumer),
-		onConsumerExpiredCallback	: onConsumerExpired,
-		onRequestedConsumerMissCallback : onRequestedConsumerMiss,
+		onNewReceiver			: onNewReceiver,
 		onMessageTargetMissCallback	: onMessageTargetMiss,
+		restConsumers			: list.New(),
+
+		receivers			: make(map[string]*ReceiverList),
 	}
+	return pool
 }
 
+/*
+* A list of receivers with same id. This allows many receivers listen
+* to the same consumer with a unique id
+*/
+type ReceiverList struct {
+	receivers map[*MessageReceiver]uint8
+	mutex sync.Mutex
+}
+/*
+* Clear all receivers in the receiver list
+*/
+func (l *ReceiverList) ClearReceivers() {
+	l.mutex.Lock()
+	l.mutex.Unlock()
+
+	for r := range l.receivers {
+		r.Stop()
+	}
+
+	l.receivers = make(map[*MessageReceiver]uint8)
+}
+func (l *ReceiverList) AddReceivers(recs... *MessageReceiver) {
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	for _, r := range recs {
+		l.receivers[r] = 0
+	}
+}
+func NewReceiverList(recs... *MessageReceiver) *ReceiverList {
+	recl := &ReceiverList{
+		receivers	: make(map[*MessageReceiver]uint8),
+	}
+
+	recl.AddReceivers(recs...)
+
+	return recl
+}
 /*
 * A base consumer pool implementation
 */
@@ -52,46 +94,75 @@ type DefaultConsumerPool struct {
 	stopFlag uint32								//Set to 1 when the pool is force to stop
 	running uint32								//Set 1 when consumer pool is running
 
-	mutex sync.RWMutex							//mutex_
+	poolMutex sync.RWMutex							//mutex_
+	mutex sync.RWMutex
 
-	consumers map[string]*Consumer					//consumers
-	onConsumerExpiredCallback func(*Consumer) error				//Called when consumer is going to be delete
-	onRequestedConsumerMissCallback func(string)(*Consumer, error)	//Called when requesting an not cached consumer
-	onMessageTargetMissCallback func(Message, ConsumerPool) error		//Called when message target is not cached
-	ticker time.Ticker							//Ticker to set expire
+	//consumers map[string]*Consumer					//consumers
+	restConsumers *list.List
+	receivers map[string]*ReceiverList
+	onNewReceiver func(string)						//Called when a new receiver with a new id is registered
+	onMessageTargetMissCallback func(Message, string) error			//Called when message target is not cached
 }
-func (p *DefaultConsumerPool) OnConsumerExpired(c *Consumer) error {
-	return p.onConsumerExpiredCallback(c)
+func (p *DefaultConsumerPool) OnNewReceiver(id string) {
+	p.onNewReceiver(id)
 }
-func (p *DefaultConsumerPool) OnRequestedConsumerMiss(id string) (*Consumer, error) {
-	return p.onRequestedConsumerMissCallback(id)
-}
-func (p *DefaultConsumerPool) OnMessageTargetMiss(m Message) error { return p.onMessageTargetMissCallback(m, p); }
+func (p *DefaultConsumerPool) OnMessageTargetMiss(m Message, id string) error { return p.onMessageTargetMissCallback(m, id); }
 func (p *DefaultConsumerPool) Consume(m Message) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
+	cos := p.Get()
+	cos.Consume(m)
+}
+/*
+* Get Receivers with the target id from pool
+*/
+func (p *DefaultConsumerPool) Receivers(id string) (*ReceiverList, bool) {
+	p.mutex.RLock()
+	defer p.mutex.RUnlock()
 
-	if _, ok := p.consumers[m.TargetId()]; !ok {
-		go func() {
-			defer func() {
-				if err := recover(); err != nil {
-					_, file, line, _ := runtime.Caller(0)
-					fmt.Println(err, file, line)
-				}
-			}()
-			err := p.OnMessageTargetMiss(m)
-			m.Finish(err)
-		}()
+	if r, ok := p.receivers[id]; ok {
+		return r, true
 	} else {
-		p.consumers[m.TargetId()].Consume(m)
+		return nil, false
 	}
+}
+/*
+* Obtain a new consumer instance from the pool
+*/
+func (p *DefaultConsumerPool) Get() *Consumer {
+	p.poolMutex.RLock()
+	defer p.poolMutex.RUnlock()
+
+	if p.restConsumers.Len() == 0 {
+		return NewConsumer(p)
+	} else {
+		cos := p.restConsumers.Back()
+		p.restConsumers.Remove(cos)
+		return cos.Value.(*Consumer)
+	}
+}
+/*
+* Recycle a consumer instance
+*/
+func (p *DefaultConsumerPool) Recycle(c *Consumer) {
+	p.poolMutex.Lock()
+	defer p.poolMutex.Unlock()
+
+	p.restConsumers.PushBack(c)
+}
+/*
+* Close and unregister a receiver from the pool
+*/
+func (p *DefaultConsumerPool) CloseReceiver(r *MessageReceiver) {
+	rs := p.receivers[r.id]
+
+	delete(rs.receivers, r)
+
 }
 func (p *DefaultConsumerPool) Start(incoming chan Message) {
 	go func() {
 		defer func() {
 			if err := recover(); err != nil {
 				_, file, line, _ := runtime.Caller(0)
-				fmt.Println(err, file, line)
+				log.Print(err, file, line)
 
 				p.Start(incoming)
 			}
@@ -111,201 +182,176 @@ func (p *DefaultConsumerPool) Stop() {
 	defer p.mutex.Unlock()
 
 	atomic.StoreUint32(&p.stopFlag, 1)
-
-	for _, c := range p.consumers {
-		c.FinishMessages(errors.New("Consumer stoped"))
-	}
 }
+/*
+* Obtain a message receiver instance from the pool, which is used to receive message
+* with the target id
+*/
 func (p *DefaultConsumerPool) ReceiveMessages(id string, race bool) (*MessageReceiver, error) {
-
-	if c, ok := p.consumers[id]; ok {
+	if rs, ok := p.receivers[id]; ok {
 		if race {
-			c.CloseReceiver()
-			c.BindReceiver(NewMessageReceiver(p, c))
-			return c.GetReceiver(), nil
+			rec := NewMessageReceiver(p, id)
+
+			rs.ClearReceivers()
+			rs.AddReceivers(rec)
+
+			return rec, nil
 		} else {
-			return nil, errors.New("Target consumer is alread listened")
+			rec := NewMessageReceiver(p, id)
+			p.receivers[id].AddReceivers(rec)
+
+			return rec, nil
 		}
 	} else {
-		var consumer *Consumer = nil
-		done := make(chan int, 1)
-
 		go func() {
 			defer func() {
 				if err := recover(); err != nil {
-					_, file, line, _ := runtime.Caller(0)
-					fmt.Println(err, file, line)
+					log.Print(err)
 				}
 			}()
-			consumer, _ = p.OnRequestedConsumerMiss(id)
 
-			done <- 1
+			p.OnNewReceiver(id)
 		}()
 
-		//routine finished or time out
-		select {
-		case <- done:
-		case <- time.After(defaultTimeout):
-		}
+		rec := NewMessageReceiver(p, id)
+		p.mutex.Lock()
+		p.receivers[id] = NewReceiverList(rec)
+		p.mutex.Unlock()
 
-		if consumer != nil {
-			//update consumer pool
-			p.mutex.Lock()
-			p.consumers[id] = consumer
-			p.consumers[id].BindReceiver(NewMessageReceiver(p, consumer))
-			p.mutex.Unlock()
-
-			return p.consumers[id].GetReceiver(), nil
-		} else {
-			return nil, errors.New("Consumer initialization failed")
-		}
+		return rec, nil
 	}
 }
-func (p *DefaultConsumerPool) StopReceiveMessages(id string) error {
-	done := make(chan int, 1)
-	go func() {
-		p.OnConsumerExpired(p.consumers[id])
 
-		done <- 1
-	}()
-
-	var err error
-
-	select {
-	case <- done:
-		err = nil
-	case <- time.After(defaultTimeout):
-		err = errors.New("Consumer expired callback time out")
-	}
-
-	p.mutex.Lock()
-	delete(p.consumers, id)
-	p.mutex.Unlock()
-
-	return err
-}
 
 /*
-* A user handler of a message consumer
-* user receiveChan to receive messages
-* when stop receive, call stop() function
+* A user handler of a message target
+* Use receiveChan to receive messages
+* When stopping receiving, call stop() function
 */
 type MessageReceiver struct {
-	ReceiveChan chan int			//This chan notify user that message is coming
+	ReceiveChan chan Message		//This chan notify user that message is coming
 	state uint32				//Is this receiver is in use
-	stopCallback func()			//Called the receiver is closed
-	withdrawCallback func() []Message	//Called when user withdraws messages
+	id string
+
+	consumePool ConsumerPool
 }
 
 /*
 * Stop receive message and expire consumer
 */
 func (r *MessageReceiver) Stop() {
-	r.stopCallback()
 	if atomic.CompareAndSwapUint32(&r.state, 1, 0) {
 		close(r.ReceiveChan)
 	}
 }
-/*
-* Unbind Message Consumer
-*/
-func (r *MessageReceiver) UnBind() {
-	if atomic.CompareAndSwapUint32(&r.state, 1, 0) {
-		close(r.ReceiveChan)
-	}
-}
-/*
-* withdraw messages buffered in consumer
-*/
-func (r *MessageReceiver) WithdrawMessages() []Message {
-	return r.withdrawCallback()
-}
-
 /*
 * Create a new message receiver
 */
-func NewMessageReceiver(pool ConsumerPool, c *Consumer) *MessageReceiver {
-	return &MessageReceiver{
-		ReceiveChan	: make(chan int),
+func NewMessageReceiver(p ConsumerPool, id string) *MessageReceiver {
+	r := &MessageReceiver{
+		ReceiveChan	: make(chan Message, DefaultReceiverBufferSize),
 		state		: 1,
-		stopCallback	: func() { pool.StopReceiveMessages(c.id) },
-		withdrawCallback: func() []Message { return c.WithdrawMessages() },
+		consumePool	: p,
+		id		: id,
 	}
+
+	return r
 }
 
 /*
-* A consumer represents a message consumer,
-* for instance, a consumer may be a user in some app
+* A consumer is used to dispatch messages, and will be active when new task is coming
+* It's block when no message is coming and will be recycled when finishing a task
 */
 type Consumer struct {
-	notified uint32			//Is user is already notified
-	id string			//Target id
+	mutex sync.RWMutex
+	consumerPool ConsumerPool
 
-	mutex sync.Mutex		//mutex_
-
-	messages []Message		//messages cached by consumer
-	receiver *MessageReceiver	//Pointer of a message receiver
+	messageChan chan Message
+	running uint32
 }
 
-func NewConsumer(id string, initBuffSize int) *Consumer {
-	if (initBuffSize < 1) {
-		initBuffSize = defaultBuffSize
-	}
+func NewConsumer(pool ConsumerPool) *Consumer {
 	return &Consumer{
-		id         : id,
-		messages   : make([]Message, 0, defaultBuffSize),
+		consumerPool		: pool,
+		messageChan		: make(chan Message),
 	}
 }
+func (c *Consumer) Stop() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	close(c.messageChan)
+}
+/*
+* Consume and dispatch a message
+*/
 func (c *Consumer) Consume(m Message) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
+	if atomic.LoadUint32(&c.running) == 0 {
+		atomic.StoreUint32(&c.running, 1)
+		go func() {
+			defer func () {
+				if err := recover(); err != nil {
+					log.Print(err)
 
-	c.messages = append(c.messages, m)
-	if atomic.LoadUint32(&c.notified) == 0 {
-		atomic.StoreUint32(&c.notified, 1)
-		c.receiver.ReceiveChan <- 1
+					atomic.StoreUint32(&c.running, 0)
+					c.consumerPool.Recycle(c)
+				}
+			}()
+
+			for {
+				message, open := <- c.messageChan
+
+				if !open {
+					break
+				}
+
+				c.dispatch(message)
+				c.consumerPool.Recycle(c)
+			}
+		}()
 	}
+
+	c.messageChan <- m
 }
-func (c *Consumer) WithdrawMessages() []Message {
-	c.FinishMessages(nil)
+/*
+* Dispatch messages to receivers, and one message with multi targets can be
+* delivered to many receivers
+*/
+func (c *Consumer) dispatch(m Message) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
 
-	c.mutex.Lock()
-	ret := c.messages
-	c.messages = make([]Message, 0, defaultBuffSize)
-	atomic.StoreUint32(&c.notified, 0)
-	c.mutex.Unlock()
+	var tids []string
 
-	return ret
-}
-func (c *Consumer) FinishMessages(err error) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	for _, m := range c.messages {
-		m.Finish(err)
+	if m.IsGroupMessage() {
+		targets := m.TargetId()
+		tids = strings.Split(targets, ";")
+	} else {
+		tids = make([]string, 1)
+		tids[0] = m.TargetId()
 	}
-}
-func (c *Consumer) BindReceiver(r *MessageReceiver) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
 
-	c.receiver = r
-	if len(c.messages) > 0 {
-		c.receiver.ReceiveChan <- 1
-		atomic.StoreUint32(&c.notified, 1)
+	for _, tid := range tids {
+		if rs, ok := c.consumerPool.Receivers(tid); ok {
+			for r := range rs.receivers {
+				select {
+				case r.ReceiveChan <- m:
+				default:
+					log.Print("Message dropped because receiver chan is busy")
+					m.Finish(errors.New("Message dropped because receiver chan is busy"))
+				}
+			}
+		} else {
+			go func() {
+				defer func() {
+					if err := recover(); err != nil {
+						log.Print(err)
+					}
+				}()
+
+				c.consumerPool.OnMessageTargetMiss(m, tid)
+				log.Print("Message Target Miss")
+			}()
+		}
 	}
-}
-func (c *Consumer) GetReceiver() *MessageReceiver {
-	c.mutex.Lock()
-	c.mutex.Unlock()
-
-	return c.receiver
-}
-func (c *Consumer) CloseReceiver() {
-	c.mutex.Lock()
-	c.mutex.Unlock()
-
-	atomic.StoreUint32(&c.notified, 0)
-	c.receiver.UnBind()
-	c.receiver = nil
 }

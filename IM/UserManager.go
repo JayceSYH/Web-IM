@@ -6,13 +6,16 @@ import (
 	"time"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"net/http"
 	"strconv"
+	"io/ioutil"
+	"strings"
+	"log"
 )
 
 const (
-	DefaultExpireTime = (time.Minute * 30)
+	DefaultReceive = iota
+	DefaultReject
 )
 
 /*
@@ -50,11 +53,113 @@ type User struct {
 
 	mutex sync.Mutex
 	disabled bool
+
+	userFilter UserFilter
 }
 func (u* User) Invalidate() {
 	u.mutex.Lock()
 	u.disabled = true
 	u.mutex.Unlock()
+}
+func (u *User) ParseParams(params string) {
+	ps := strings.Split(params, "\n")
+	for _, p := range ps {
+		index := strings.Index(p, ":")
+
+		if index == -1 {
+			continue
+		}
+
+		key := p[:index]
+		content := p[index + 1:]
+
+		switch key {
+		case "RL":
+			us := strings.Split(content, ";")
+			u.userFilter.AddToReceiveList(us)
+			break
+		case "BL":
+			us := strings.Split(content, ";")
+			u.userFilter.AddToBlackList(us)
+			break
+		default:
+		}
+	}
+}
+func NewUser(id string, checkCode string, expireTime time.Duration, recMode uint8, params... string) *User {
+	u := &User{
+		id		: id,
+		checkCode	: checkCode,
+		expireTime	: expireTime,
+
+		userFilter	: UserFilter{
+			receiveList	: make(map[string]uint8),
+			blackList	: make(map[string]uint8),
+			recMode		: recMode,
+		},
+	}
+
+	if len(params) > 0 {
+		u.ParseParams(params[0])
+	}
+
+	return u
+}
+
+type UserFilter struct {
+	recMode uint8
+	blackList map[string]uint8
+	receiveList map[string]uint8
+}
+
+func (f *UserFilter) AddToReceiveList(users []string) {
+	for _, u := range users {
+		f.receiveList[u] = 0
+	}
+}
+func (f *UserFilter) RemoveFromReceiveList(users []string) {
+	for _, u := range users {
+		delete(f.receiveList, u)
+	}
+}
+func (f *UserFilter) AddToBlackList(users []string) {
+	for _, u := range users {
+		f.blackList[u] = 0
+	}
+}
+func (f *UserFilter) RemoveFromBlackList(users []string) {
+	for _, u := range users {
+		delete(f.blackList, u)
+	}
+}
+func (f *UserFilter) IsReceived(id string) bool {
+	for s := range f.blackList {
+		if s == id {
+			return false
+		}
+	}
+	for s := range f.receiveList {
+		if s == id {
+			return true
+		}
+	}
+
+	if f.recMode == DefaultReceive {
+		return true
+	} else {
+		return false
+	}
+}
+func (f *UserFilter) Filter(src_ms []Message) []Message {
+	res_ms := make([]Message, 0, 5)
+	for _, m := range src_ms {
+		sid := m.SenderId()
+		if f.IsReceived(sid) {
+			res_ms = append(res_ms, m)
+		}
+	}
+
+	return res_ms
 }
 
 func NewCheckCode(id string) (string, error) {
@@ -66,7 +171,7 @@ func NewCheckCode(id string) (string, error) {
 /*
 * Register a user with user's id and the secret key
 */
-func (m *UserManager) RegisterUser(validation string, id string, expireTime time.Duration) (string, error) {
+func (m *UserManager) RegisterUser(validation string, id string, expireTime time.Duration, recMode uint8, params... string) (string, error) {
 	m.mutex.RLock()
 	sk := m.secretKey
 	m.mutex.RUnlock()
@@ -74,16 +179,12 @@ func (m *UserManager) RegisterUser(validation string, id string, expireTime time
 	if validation == sk {
 		checkCode, err := NewCheckCode(id)
 		if err != nil {
-			fmt.Println(err)
+			log.Print(err)
 			return "", err
 		}
 
 		m.mutex.Lock()
-		m.users[checkCode] = &User{
-			id		: id,
-			checkCode	: checkCode,
-			expireTime	: expireTime,
-		}
+		m.users[checkCode] = NewUser(id, checkCode, expireTime, recMode, params...)
 		m.mutex.Unlock()
 
 		return checkCode, nil
@@ -114,18 +215,17 @@ func (m *UserManager) UpdateSecretKey(validation string, newKey string) error {
 /*
 * Get a registered user by passing the checkCode returned by RegisterUser
 */
-func (m *UserManager) Validate(checkCode string) (string, error) {
+func (m *UserManager) Validate(checkCode string) (*User, error) {
 	if u, ok := m.users[checkCode]; ok {
 		if !u.disabled {
-			return u.id, nil
+			return u, nil
 		} else {
-			return "", errors.New("user expired")
+			return nil, errors.New("user expired")
 		}
 	} else {
-		return "", errors.New("no user matched")
+		return nil, errors.New("no user matched")
 	}
 }
-
 func (m *UserManager) StartExpireCheck(d time.Duration) {
 	if m.ticker != nil {
 		m.ticker.Stop()
@@ -141,7 +241,7 @@ func (m *UserManager) StartExpireCheck(d time.Duration) {
 func (m *UserManager) ExpireCheck() {
 	defer func() {
 		if err := recover(); err != nil {
-			fmt.Println(err)
+			log.Print(err)
 		}
 	}()
 
@@ -176,7 +276,11 @@ func (m *UserManager) ExpireCheck() {
 * "User-Id":"xxxx"
 * "Secret-Key":"xxxxx"
 * "Expire-Time":"xxxxxx"    //minite
-*
+* "Received-Mode":"xxxxx"   //choices : "DefaultReceive" 、 "DefaultReject"
+* "Content-Type":"text/plain"
+* -------------Content----------------
+* BL:user1;user2;...;		//black list
+* RL:user1;user2;...;		//receive list
 *
 * Return data format is:
 * stateCode;checkCode
@@ -185,6 +289,8 @@ func (m *UserManager) ExpireCheck() {
 * eg2:error;xxxxxxxx
 */
 func (m *UserManager) ServeRegister(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+
 	if expire, ok := r.Header["Expire-Time"]; ok {
 		var expireTime time.Duration
 
@@ -197,7 +303,25 @@ func (m *UserManager) ServeRegister(w http.ResponseWriter, r *http.Request) {
 
 		if userId, ok := r.Header["User-Id"]; ok {
 			if secretKey, ok := r.Header["Secret-Key"]; ok {
-				if checkCode, err := m.RegisterUser(secretKey[0], userId[0], expireTime); err == nil {
+				var recMode uint8
+				if rec, ok := r.Header["Receive-Mode"]; ok {
+					switch rec[0] {
+					case "DefaultReceive":
+						recMode = DefaultReceive
+						break
+					case "DefaultReject":
+						recMode = DefaultReject
+						break
+					default:
+						recMode = DefaultReceive
+					}
+				} else {
+					recMode = DefaultReceive
+				}
+
+				body, _ := ioutil.ReadAll(r.Body)
+				log.Print(string(body))
+				if checkCode, err := m.RegisterUser(secretKey[0], userId[0], expireTime, recMode, string(body)); err == nil {
 					w.Write([]byte("ok;" + checkCode))
 				} else {
 					w.Write([]byte("error;"))
@@ -209,6 +333,53 @@ func (m *UserManager) ServeRegister(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte("error;"))
 		}
 	}
+}
+
+/*
+* Put request should obey the following format:
+* ----------------Headers-----------------------
+* "User-CheckCode":"xxxxx"
+* "List":"xxxxx"			//list can be "RL" "BL"
+* ----------------Content-----------------------
+* Add u1;u2				//Add users to the list
+* Del u1;u2				//Del users from the list
+*/
+func (m *UserManager) ServeUpdateReceiveList(w http.ResponseWriter, r * http.Request) {
+	defer r.Body.Close()
+
+	if check, ok := r.Header["User-CheckCode"]; ok {
+		if list, ok := r.Header["List"]; ok && (list[0] == "RL" || list[0] == "BL") {
+			body, _ := ioutil.ReadAll(r.Body)
+
+			cmds := strings.Split(string(body), "\n")
+			for _, cmd := range cmds {
+				parts := strings.Split(cmd, " ")
+				if len(parts) < 2 {
+					continue
+				}
+
+				switch parts[0] {
+				case "Add":
+					us := strings.Split(parts[1], ";")
+					if list[0] == "RL" {
+						m.users[check[0]].userFilter.AddToReceiveList(us)
+					} else {
+						m.users[check[0]].userFilter.AddToBlackList(us)
+					}
+					break
+				case "Del":
+					us := strings.Split(parts[1], ";")
+					if list[0] == "RL" {
+						m.users[check[0]].userFilter.RemoveFromReceiveList(us)
+					} else {
+						m.users[check[0]].userFilter.RemoveFromBlackList(us)
+					}
+					break
+				default:
+				}
+			}
+		} else { log.Print("update list not set") }
+	} else { log.Print("user not set") }
 }
 
 
@@ -232,3 +403,4 @@ func (m *UserManager) ServeUpdateKey(w http.ResponseWriter, r *http.Request) {
 		} else { w.Write([]byte("error;")) }
 	} else { w.Write([]byte("error;")) }
 }
+

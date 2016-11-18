@@ -3,8 +3,8 @@ package IM
 import (
 	"errors"
 	"time"
-	"fmt"
 	"strings"
+	"log"
 )
 
 /*
@@ -30,9 +30,8 @@ type IM struct {
 	host string
 	port string
 
-	onConsumerExpiredCallback func(*Consumer) error
-	onRequestedConsumerMissCallback func(string)(*Consumer, error)
-	onMessageTargetMissCallback func(Message, ConsumerPool) error
+	onNewReceiver func(string)
+	onMessageTargetMissCallback func(Message, string) error
 
 	communication *Communication
 	communicationPath string
@@ -90,8 +89,8 @@ func (im *IM) ReceiveMessages(id string, t string, race bool) (*MessageReceiver,
 */
 func (im *IM) SetChannel(n ChannelNewer,mt string, channelNum uint32, channelBuffSize uint32, gm GroupManager) {
 	if (channelBuffSize < 1) {
-		fmt.Println("Channel buffer size must be more than 1")
-		fmt.Printf("Channel buffer size is set to default: %d\n", DefaultChannelBufferSize)
+		log.Print("Channel buffer size must be more than 1")
+		log.Printf("Channel buffer size is set to default: %d\n", DefaultChannelBufferSize)
 		channelBuffSize = DefaultChannelBufferSize
 	}
 
@@ -102,8 +101,8 @@ func (im *IM) SetChannel(n ChannelNewer,mt string, channelNum uint32, channelBuf
 }
 func (im *IM) SetClassifierNum(cn uint32) {
 	if cn < 1 {
-		fmt.Println("At least one message classifier is needed")
-		fmt.Printf("Classifier num is set to default: %d\n", defaultClassifierNum)
+		log.Print("At least one message classifier is needed")
+		log.Printf("Classifier num is set to default: %d\n", defaultClassifierNum)
 		cn = defaultClassifierNum
 	}
 	im.classifierNum = cn
@@ -131,7 +130,7 @@ func (im *IM) SetUserManager(secretKey string, registerURL string, updateSecretU
 	im.registerURL = registerURL
 	im.updateSecretURL = updateSecretURL
 }
-func (im *IM) Validate(validation string) (string, error) {
+func (im *IM) Validate(validation string) (*User, error) {
 	return im.UserManager.Validate(validation)
 }
 
@@ -139,25 +138,20 @@ func (im *IM) Validate(validation string) (string, error) {
 * consumer callbacks are called in consumer pool when a message can't find its target consumer or
 * the message is going to be expired or a consumer stored in database need to be loaded to cache pool
 */
-func (im *IM) SetConsumerCallbacks(onConsumerExpiredCallback func(*Consumer) error,
-	onRequestedConsumerMissCallback func(string)(*Consumer, error),
-	onMessageTargetMissCallback func(Message, ConsumerPool) error) {
+func (im *IM) SetConsumerCallbacks(onNewReceiverCallback func(string),
+	onMessageTargetMissCallback func(Message, string) error) {
 
 	e := errors.New("Message not handled")
 
-	if (onRequestedConsumerMissCallback == nil) {
-		onRequestedConsumerMissCallback = func(id string) (*Consumer, error) { return NewConsumer(id, defaultBuffSize), e }
-	}
 	if (onMessageTargetMissCallback == nil) {
-		onMessageTargetMissCallback = func(m Message, p ConsumerPool) error { return e }
+		onMessageTargetMissCallback = func(m Message, p string) error { return e }
 	}
-	if (onConsumerExpiredCallback == nil) {
-		onConsumerExpiredCallback = func(c *Consumer) error { return e }
+	if (onNewReceiverCallback == nil) {
+		onNewReceiverCallback = func(id string) {}
 	}
 
-	im.onConsumerExpiredCallback = onConsumerExpiredCallback
 	im.onMessageTargetMissCallback = onMessageTargetMissCallback
-	im.onRequestedConsumerMissCallback = onRequestedConsumerMissCallback
+	im.onNewReceiver = onNewReceiverCallback
 
 	im.consumerInit = true
 }
@@ -174,7 +168,7 @@ func (im *IM) init() {
 	im.consumerPools = make(map[string]ConsumerPool)
 	for _, g := range im.channelGroups {
 		g.SetMessageClassifiers(im.classifiers)
-		im.consumerPools[g.mt] = NewConsumerPool(im.onConsumerExpiredCallback, im.onRequestedConsumerMissCallback, im.onMessageTargetMissCallback)
+		im.consumerPools[g.mt] = NewConsumerPool(im.onNewReceiver, im.onMessageTargetMissCallback)
 		im.consumerPools[g.mt].Start(g.sendingMessage)
 		g.StartChannels()
 		if g.gm != nil {

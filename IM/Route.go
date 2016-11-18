@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"github.com/astaxie/beego"
 	"github.com/astaxie/beego/context"
-	"fmt"
+	"log"
 )
 
 type Router interface {
@@ -23,6 +23,7 @@ func (r *BeeGoRouter) Route(url string, h http.Handler) {
 
 func (r *BeeGoRouter) RouteFunc(url string, f func(http.ResponseWriter, *http.Request)) {
 	beego.Any(url, func(c *context.Context) {
+
 		f(c.ResponseWriter.ResponseWriter, c.Request)
 	})
 }
@@ -52,7 +53,7 @@ func route(im *IM) {
 		hash := c.Input.Param(":hash")
 
 		if file, err := im.FetchFile(hash); err != nil {
-			fmt.Println(err)
+			log.Print(err)
 		} else {
 			c.ResponseWriter.Write(file)
 		}

@@ -2,12 +2,27 @@ package IM
 
 import (
 	"net/http"
-	"fmt"
+	"errors"
+	"log"
 )
 
 const (
 	DefaultFILERootPath = "IM_TEMP_FILE"
 )
+
+var communications  map[string]*Communication
+
+func init() {
+	communications = make(map[string]*Communication)
+}
+
+func GetCommunication(id string) (*Communication, error) {
+	if c, ok := communications[id]; ok {
+		return c, nil
+	} else {
+		return nil, errors.New("No such communication(id='" + id + "')")
+	}
+}
 
 /*
 * Communication controls the communication connection between client and server
@@ -46,8 +61,13 @@ func (c *Communication) parseText(ms []Message) []*Frame {
 	fs := make([]*Frame, len(ms))
 	for i, m := range ms {
 		if s, ok := m.Content().(string); ok {
-			fs[i] = NewFrame(TextMessageType, s, m.SenderId())
-		} else { fs[i] = NewFrame(TextMessageType, "", m.SenderId()) }
+			fs[i] = NewFrame(TextMessageType, s)
+		} else { fs[i] = NewFrame(TextMessageType, ""); }
+
+		fs[i].AddMeta(Sender, m.SenderId())
+		if m.IsGroupMessage() {
+			fs[i].AddMeta(Group, m.GroupName())
+		}
 	}
 
 	return fs
@@ -59,9 +79,14 @@ func (c *Communication) parseImage(ms []Message) []*Frame {
 		if pm, ok := m.(*PictureMessage); ok {
 			if bs, ok := pm.Content().([]byte); ok {
 				url := c.imageProxy.AddDisposalFileWithRestfulAPI(bs, pm.Suffix())
-				fs[i] = NewFrame(PictureMessageType, url, m.SenderId())
-			} else { fs[i] = NewFrame(PictureMessageType, "", m.SenderId()) }
-		} else { fs[i] = NewFrame(PictureMessageType, "", m.SenderId()) }
+				fs[i] = NewFrame(PictureMessageType, url)
+			} else { fs[i] = NewFrame(PictureMessageType, "") }
+		} else { fs[i] = NewFrame(PictureMessageType, "") }
+
+		fs[i].AddMeta(Sender, m.SenderId())
+		if m.IsGroupMessage() {
+			fs[i].AddMeta(Group, m.GroupName())
+		}
 	}
 
 	return fs
@@ -73,12 +98,23 @@ func (c *Communication) parseFile(ms []Message) []*Frame {
 		if pm, ok := m.(*FileMessage); ok {
 			if bs, ok := pm.Content().([]byte); ok {
 				url := c.fileProxy.AddDisposalNamedFileWithRestfulAPI(bs, pm.FileName())
-				fs[i] = NewFrame(FileMessageType, url, m.SenderId())
-			} else { fs[i] = NewFrame(PictureMessageType, "", m.SenderId()) }
-		} else { fs[i] = NewFrame(PictureMessageType, "", m.SenderId()) }
+				fs[i] = NewFrame(FileMessageType, url)
+			} else { fs[i] = NewFrame(PictureMessageType, "") }
+		} else { fs[i] = NewFrame(PictureMessageType, "") }
+
+		fs[i].AddMeta(Sender, m.SenderId())
+		if m.IsGroupMessage() {
+			fs[i].AddMeta(Group, m.GroupName())
+		}
 	}
 
 	return fs
+}
+func (c *Communication) AddMessageFilter(filter MessageFilter) {
+	c.broker.AddFilter(filter)
+}
+func (c *Communication) ClearMessageFilter() {
+	c.broker.ClearFilter()
 }
 
 /*
@@ -87,13 +123,16 @@ func (c *Communication) parseFile(ms []Message) []*Frame {
 * communicationURL/(checkCode)
 */
 func (c *Communication) Start(w http.ResponseWriter, r *http.Request, checkCode string) {
-	if id, err := c.im.Validate(checkCode); err != nil {
-		fmt.Println(err)
+	if u, err := c.im.Validate(checkCode); err != nil {
+		log.Print(err)
 		return
 	} else {
 		c.broker.AddParseFunc(TextMessageType, c.parseText)
 		c.broker.AddParseFunc(PictureMessageType, c.parseImage)
 		c.broker.AddParseFunc(FileMessageType, c.parseFile)
-		c.broker.StartProxy(id, w)
+		communications[u.id] = c
+		c.broker.ClearFilter()
+		c.broker.AddFilter(&u.userFilter)
+		c.broker.StartProxy(u.id, w)
 	}
 }

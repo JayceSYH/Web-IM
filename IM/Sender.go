@@ -3,18 +3,19 @@ package IM
 import (
 	"net/http"
 	"io/ioutil"
-	"fmt"
+	"github.com/labstack/gommon/log"
 )
 /*
 * Send Text Message With following request format:
 * Note: message with post method
 * --------------headers:---------------
 * "Content-Type":"application/octet-stream"
-* "Target-Id":"xxxx"
+* "Target-Id":"xxxx"				//if it's a group message(Group-Id is set), format:"target1;target2"
+* "Group-Id":"xxxx"				//set when you message is going to be delivered to several other users
 * "Check-Code":"xxxxx"
 * "Message-Type":"xxxx"
-* "File-Name" : "xxxxx"  //if it's a file message
-* "Pic-Suffix" : "xxx"   //if it's a picture message
+* "File-Name" : "xxxxx"  			//if it's a file message
+* "Pic-Suffix" : "xxx"   			//if it's a picture message
 * --------------body-------------------
 * ::the content you want to send
 *
@@ -24,54 +25,68 @@ import (
 * TextMessage 、 PictureMessage 、 FileMessage
 */
 
-func SendMessageHandleFunc(r *http.Request, validateFunc func(string) (string, error)) Message {
+func SendMessageHandleFunc(r *http.Request, validateFunc func(string) (*User, error)) Message {
 	defer r.Body.Close()
 
 	var senderId string
 	if checkCode, ok := r.Header["Check-Code"]; ok {
-		if send, err := validateFunc(checkCode[0]); err != nil {
-			fmt.Println(err)
+		if u, err := validateFunc(checkCode[0]); err != nil {
+			log.Print(err)
 			return nil
 		} else {
-			senderId = send
+			senderId = u.id
 		}
 	}
 
 	if targetId, ok := r.Header["Target-Id"]; ok {
 		if messageType, ok := r.Header["Message-Type"]; ok {
+			var group []string
+			if group, ok = r.Header["Group-Id"]; !ok {
+				group = make([]string, 0)
+			}
+
 			body, _ := ioutil.ReadAll(r.Body)
 
 			switch messageType[0] {
 			case TextMessageType:
 				m := NewTextMessage(string(body))
-				fmt.Println("content:",string(body))
+				log.Print("content:",string(body))
 				m.SetTargetId(targetId[0])
 				m.SetSenderId(senderId)
+				if len(group) > 0 {
+					m.SetGroup(group[0])
+				}
 				return m
 			case PictureMessageType:
 				if suffix, ok := r.Header["Pic-Suffix"]; ok {
 					m := NewPictureMessage(body, suffix[0])
 					m.SetTargetId(targetId[0])
 					m.SetSenderId(senderId)
+					if len(group) > 0 {
+						m.SetGroup(group[0])
+					}
 					return m
 				}
-				fmt.Println("Picture Suffix Missed")
+				log.Print("Picture Suffix Missed")
 				break
 			case FileMessageType:
 				if fileName, ok := r.Header["File-Name"]; ok {
 					m := NewFileMessage(body, fileName[0])
 					m.SetTargetId(targetId[0])
 					m.SetSenderId(senderId)
+					if len(group) > 0 {
+						m.SetGroup(group[0])
+					}
 					return m
 				}
-				fmt.Println("Filename Missed")
+				log.Print("Filename Missed")
 				break
 			}
 		} else {
-			fmt.Println("Message Type Missed")
+			log.Print("Message Type Missed")
 		}
 	} else {
-		fmt.Println("TargetId Missed")
+		log.Print("TargetId Missed")
 	}
 
 	return nil

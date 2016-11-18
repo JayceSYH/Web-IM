@@ -2,8 +2,8 @@ package IM
 
 import (
 	"sync"
-	"fmt"
 	"errors"
+	"log"
 )
 
 const (
@@ -57,7 +57,7 @@ func (c *DefaultMessageClassifier) Classify(m Message) {
 		select {
 		case g.incomingMessage <- m:
 		default:
-			fmt.Printf("message discarded(%s)", m.Type())
+			log.Print("message discarded(%s)", m.Type())
 			m.Finish(errors.New("message discarded(channel group is busy)"))
 		}
 	}else {
